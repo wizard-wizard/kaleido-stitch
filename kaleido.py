@@ -1,373 +1,232 @@
-
-"""
-Kaleido Stitch — kaleidoscopic 35×35 cross-stitch chart generator (D8 symmetry).
-
-- Fixed size: 35×35
-- Perfect 8-way (D8) symmetry via octant folding
-- 7-color palettes (index 0 = background)
-
-This module provides:
-- design functions -> 35×35 index grid
-- palettes
-- renderers for chart/preview/legend
-- a helper that returns a ZIP bundle (PNG + CSV + PDF)
-
-MIT-ish: do whatever you want; credit appreciated but not required.
-"""
-from __future__ import annotations
-
-import io, math, random, csv, zipfile
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+import math
+import random
+from typing import Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
+from PIL import Image, ImageDraw
 
-N = 35
-CX = CY = N // 2  # 17
+GRID = 35  # fixed for now
 
-def fold_d8(dx: int, dy: int) -> Tuple[int, int]:
-    """
-    Fold (dx,dy) into the fundamental octant for D8 symmetry:
-    - reflect across x/y axes (abs)
-    - reflect across diagonal y=x (ensure dy <= dx)
-    """
-    dx, dy = abs(dx), abs(dy)
-    if dy > dx:
-        dx, dy = dy, dx
-    return dx, dy
-
-def make_pattern_octant(func: Callable[[int, int], int]) -> np.ndarray:
-    """
-    Build a full N×N grid by folding each coordinate into an octant and calling func(fx,fy).
-    """
-    grid = np.zeros((N, N), dtype=np.int32)
-    for y in range(N):
-        for x in range(N):
-            dx, dy = x - CX, y - CY
-            fx, fy = fold_d8(dx, dy)
-            grid[y, x] = int(func(fx, fy))
-    return grid
-
-def quantize(val: float, thresholds: List[float]) -> int:
-    """
-    thresholds ascending; returns bin index 0..len(thresholds)
-    """
-    for i, t in enumerate(thresholds):
-        if val < t:
-            return i
-    return len(thresholds)
-
-def hex_to_rgb(h: str) -> Tuple[int, int, int]:
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-def _mode_filter(idx: np.ndarray, radius: int = 1, passes: int = 1) -> np.ndarray:
-    """Replace each cell with the most common value in its neighborhood."""
-    out = idx.copy()
-    h, w = out.shape
-    for _ in range(max(0, passes)):
-        nxt = out.copy()
-        for y in range(h):
-            y0 = max(0, y - radius)
-            y1 = min(h, y + radius + 1)
-            for x in range(w):
-                x0 = max(0, x - radius)
-                x1 = min(w, x + radius + 1)
-                window = out[y0:y1, x0:x1].ravel()
-                vals, counts = np.unique(window, return_counts=True)
-                nxt[y, x] = vals[np.argmax(counts)]
-        out = nxt
-    return out
-
-def _outline_edges(idx: np.ndarray, ink_idx: int = 1, thickness: int = 1) -> np.ndarray:
-    """Draw an outline where neighboring cells differ (8-neighborhood)."""
-    h, w = idx.shape
-    edge = np.zeros((h, w), dtype=bool)
-
-    # Compare against shifted versions (8 directions)
-    shifts = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
-    for dy, dx in shifts:
-        y0 = max(0, dy); y1 = h + min(0, dy)
-        x0 = max(0, dx); x1 = w + min(0, dx)
-        a = idx[y0:y1, x0:x1]
-        b = idx[y0-dy:y1-dy, x0-dx:x1-dx]
-        edge[y0:y1, x0:x1] |= (a != b)
-
-    out = idx.copy()
-    out[edge] = ink_idx
-
-    # Thicken by simple dilation
-    for _ in range(max(0, thickness - 1)):
-        e2 = edge.copy()
-        for dy, dx in shifts:
-            y0 = max(0, dy); y1 = h + min(0, dy)
-            x0 = max(0, dx); x1 = w + min(0, dx)
-            e2[y0:y1, x0:x1] |= edge[y0-dy:y1-dy, x0-dx:x1-dx]
-        edge = e2
-        out[edge] = ink_idx
-
-    return out
-
-def postprocess_indices(
-    idx: np.ndarray,
-    coherence: int = 0,
-    radius: int = 1,
-    ink: bool = False,
-    ink_idx: int = 1,
-    ink_thickness: int = 1,
-) -> np.ndarray:
-    out = idx
-    if coherence and coherence > 0:
-        out = _mode_filter(out, radius=radius, passes=coherence)
-    if ink:
-        out = _outline_edges(out, ink_idx=ink_idx, thickness=ink_thickness)
-    return out
-
-# -------------------------
-# Palettes (7 colors each)
-# index 0 = background
-# -------------------------
+# --- Palettes (index 0 is background). Up to 7 colors total. ---
 PALETTES: Dict[str, List[str]] = {
-    "jewel_bazaar": ["#F7F0E8", "#1B4F72", "#7D3C98", "#117A65", "#B03A2E", "#AF601A", "#5D4037"],
-    "forest_copper": ["#FBF6EF", "#1E2D24", "#2E6B4F", "#7A8F3A", "#B76E3A", "#6B3E26", "#2A7FAA"],
-    "ocean_coral":  ["#F5FBFF", "#0B3954", "#087E8B", "#BFD7EA", "#FF5A5F", "#C81D25", "#4E8098"],
-    "night_neon":   ["#0A0A0B", "#00E5FF", "#FF2EEA", "#FFD400", "#00FF6A", "#7C4DFF", "#FFFFFF"],
-    "antique_sampler":["#FAF5EA","#2E2A24","#6C4B3B","#A77B5A","#C2A46B","#6E7F63","#9B4F4F"],
+    "jewel_bazaar": ["#0b0f14", "#2dd4bf", "#60a5fa", "#a78bfa", "#fb7185", "#fbbf24", "#34d399"],
+    "moth_moon":    ["#0a0c10", "#cbd5e1", "#94a3b8", "#a78bfa", "#38bdf8", "#f472b6", "#fbbf24"],
+    "forest_glow":  ["#070b09", "#14532d", "#22c55e", "#a3e635", "#10b981", "#0ea5e9", "#facc15"],
+    "embers":       ["#0b0b0f", "#7f1d1d", "#ef4444", "#f97316", "#fbbf24", "#fde68a", "#f43f5e"],
+    "sea_glass":    ["#070b10", "#0ea5e9", "#22d3ee", "#34d399", "#a7f3d0", "#c7d2fe", "#f5d0fe"],
+    "ink_copper":   ["#07070a", "#e2e8f0", "#94a3b8", "#b45309", "#f59e0b", "#fb7185", "#38bdf8"],
+    "sunset_sorbet":["#090a10", "#fb7185", "#f97316", "#fbbf24", "#60a5fa", "#a78bfa", "#34d399"],
+    "lichen_stone": ["#0a0e0c", "#e7e5e4", "#a8a29e", "#65a30d", "#84cc16", "#22c55e", "#0ea5e9"],
 }
 
-# -------------------------
-# Designs (each returns 0..6)
-# -------------------------
-def _edge_mask(fx: int, fy: int, maxd: int = 16) -> bool:
-    # Keep a clean, centered diamond-ish boundary.
-    return max(fx, fy) <= maxd
-
-def design_rings_spokes(seed: int = 0) -> np.ndarray:
-    rng = random.Random(seed)
-    k_r = rng.uniform(0.55, 0.9)
-    k_a = rng.uniform(4.5, 7.0)
-    wob = rng.uniform(0.15, 0.35)
-    thresholds = [-0.55, -0.25, -0.05, 0.10, 0.28, 0.52]  # 7 bins
-    def f(fx: int, fy: int) -> int:
-        if not _edge_mask(fx, fy): return 0
-        r = math.sqrt(fx*fx + fy*fy) + 1e-6
-        a = math.atan2(fy, fx + 1e-6)
-        val = math.sin(r*k_r) * 0.65 + math.cos(a*k_a) * 0.55 + math.sin((fx-fy)*0.7) * wob
-        return quantize(val, thresholds)
-    return make_pattern_octant(f)
-
-def design_petal_vault(seed: int = 0) -> np.ndarray:
-    rng = random.Random(seed)
-    k1 = rng.uniform(0.35, 0.55)
-    k2 = rng.uniform(1.2, 1.8)
-    thresholds = [-0.4, -0.15, 0.05, 0.20, 0.38, 0.60]
-    def f(fx: int, fy: int) -> int:
-        if not _edge_mask(fx, fy): return 0
-        r = math.sqrt(fx*fx + fy*fy) + 1e-6
-        a = math.atan2(fy, fx + 1e-6)
-        val = math.cos(r*k1) * (0.65 + 0.35*math.cos(a*8)) + 0.35*math.sin((fx+fy)*k2)
-        if r < 2.2:
-            val += 0.7
-        return quantize(val, thresholds)
-    return make_pattern_octant(f)
-
-def design_starburst(seed: int = 0) -> np.ndarray:
-    rng = random.Random(seed)
-    k = rng.uniform(0.85, 1.15)
-    thresholds = [-0.45, -0.2, 0.0, 0.18, 0.35, 0.55]
-    def f(fx: int, fy: int) -> int:
-        if not _edge_mask(fx, fy): return 0
-        r = math.sqrt(fx*fx + fy*fy) + 1e-6
-        a = math.atan2(fy, fx + 1e-6)
-        val = (math.cos(a*12) * 0.7 + math.cos(r*k) * 0.6 + math.sin((fx-fy)*0.9) * 0.25)
-        if fy == 0 or fx == fy:
-            val += 0.35
-        return quantize(val, thresholds)
-    return make_pattern_octant(f)
-
-def design_mosaic_steps(seed: int = 0) -> np.ndarray:
-    thresholds = [0.6, 1.15, 1.7, 2.2, 2.8, 3.4]
-    def f(fx: int, fy: int) -> int:
-        if not _edge_mask(fx, fy): return 0
-        v = 0.0
-        v += 1.1 if ((fx+fy) % 4 in (0,1)) else 0.0
-        v += 1.0 if ((fx-fy) % 5 in (0,1)) else 0.0
-        v += 0.9 if (fx % 3 == 0 or fy % 3 == 0) else 0.0
-        r = int(math.sqrt(fx*fx + fy*fy))
-        v += (r % 6) * 0.35
-        v += 0.8 if ((fx*fy) % 11 == 0) else 0.0
-        return quantize(v, thresholds)
-    return make_pattern_octant(f)
-
-def design_knotwork(seed: int = 0) -> np.ndarray:
-    thresholds = [0.7, 1.35, 2.0, 2.55, 3.2, 3.9]
-    def f(fx: int, fy: int) -> int:
-        if not _edge_mask(fx, fy): return 0
-        v = 0.0
-        v += 1.8 if (fx % 4 in (1,2)) and (fy % 6 in (2,3)) else 0.0
-        v += 1.6 if (fy % 4 in (1,2)) and (fx % 6 in (2,3)) else 0.0
-        r = math.sqrt(fx*fx + fy*fy)
-        v += 1.5 if int(r) % 5 == 0 else 0.0
-        v += 0.8 if (fx % 7 == 0 and fy % 7 == 0) else 0.0
-        v += 0.6*(math.sin((fx+1)*0.8) + math.cos((fy+1)*0.7))
-        return quantize(v, thresholds)
-    return make_pattern_octant(f)
-
-def design_lattice_garden(seed: int = 0) -> np.ndarray:
-    thresholds = [-0.4, -0.15, 0.05, 0.22, 0.40, 0.62]
-    def f(fx: int, fy: int) -> int:
-        if not _edge_mask(fx, fy): return 0
-        r = math.sqrt(fx*fx + fy*fy) + 1e-6
-        val = 0.45*math.sin(fx*0.9) + 0.45*math.cos(fy*1.05) + 0.55*math.cos(r*0.55)
-        val += 0.25*math.cos((fx-fy)*1.7)
-        return quantize(val, thresholds)
-    return make_pattern_octant(f)
-
-DESIGNS: Dict[str, Callable[[int], np.ndarray]] = {
-    "rings_spokes": design_rings_spokes,
-    "petal_vault": design_petal_vault,
-    "starburst": design_starburst,
-    "mosaic_steps": design_mosaic_steps,
-    "knotwork": design_knotwork,
-    "lattice_garden": design_lattice_garden,
+PALETTE_LABELS = {
+    "jewel_bazaar": "Jewel Bazaar",
+    "moth_moon": "Moth & Moon",
+    "forest_glow": "Forest Glow",
+    "embers": "Embers",
+    "sea_glass": "Sea Glass",
+    "ink_copper": "Ink & Copper",
+    "sunset_sorbet": "Sunset Sorbet",
+    "lichen_stone": "Lichen Stone",
 }
 
-# -------------------------
+# --- Design registry ---
+DESIGN_LABELS = {
+    "rosette_lines": "Rosette Lines (contiguous + strong bands)",
+    "petal_fan": "Petal Fan (soft wedges)",
+    "rings_spokes": "Rings + Spokes (classic)",
+    "labyrinth": "Labyrinth (chunky paths)",
+    "starweave": "Starweave (crisp star geometry)",
+    "bloomfield": "Bloomfield (big color fields)",
+}
+
+# -----------------------------
+# Symmetry + helpers
+# -----------------------------
+
+def _d8_fold_from_octant(octant: np.ndarray) -> np.ndarray:
+    """
+    octant is a square array sized N×N describing one octant-ish wedge.
+    We turn it into a full GRID×GRID with perfect D8 symmetry.
+    """
+    n = octant.shape[0]
+    half = GRID // 2 + 1  # 18 for 35
+    if n != half:
+        raise ValueError(f"octant must be {half}×{half} for GRID={GRID}")
+
+    # Create a quadrant by mirroring across diagonal
+    quad = np.minimum(octant, octant.T) * 0 + octant  # keep dtype
+    quad = np.triu(quad) + np.triu(quad, 1).T  # mirror across diagonal
+
+    # Mirror to full grid (D4), then add rotations (D8 is covered by diag + mirrors)
+    top = np.concatenate([quad[:, :-1], np.fliplr(quad)], axis=1)  # width 35
+    full = np.concatenate([top[:-1, :], np.flipud(top)], axis=0)   # height 35
+    return full
+
+def _majority_smooth(grid: np.ndarray, k: int, iters: int) -> np.ndarray:
+    """
+    Simple majority filter that strongly increases contiguous areas.
+    """
+    if iters <= 0:
+        return grid
+    g = grid.copy()
+    h, w = g.shape
+    for _ in range(iters):
+        out = g.copy()
+        for y in range(h):
+            y0, y1 = max(0, y-1), min(h, y+2)
+            for x in range(w):
+                x0, x1 = max(0, x-1), min(w, x+2)
+                patch = g[y0:y1, x0:x1].ravel()
+                counts = np.bincount(patch, minlength=k)
+                out[y, x] = int(np.argmax(counts))
+        g = out
+    return g
+
+def _quantize_field(field: np.ndarray, ncolors: int) -> np.ndarray:
+    """
+    Map a float field to indices 0..ncolors-1 with quantile-ish buckets.
+    """
+    f = field.copy()
+    f = (f - f.min()) / (f.max() - f.min() + 1e-9)
+    # Make background slightly more likely
+    # (helps negative space + nicer “stitch chart” readability)
+    bins = np.linspace(0, 1, ncolors + 1)
+    idx = np.digitize(f, bins[1:-1], right=False)
+    return idx.astype(np.int32)
+
+def _octant_coords() -> Tuple[np.ndarray, np.ndarray]:
+    half = GRID // 2 + 1
+    y, x = np.mgrid[0:half, 0:half]
+    # normalize to center at (0,0) being the middle of the full grid
+    cx = (GRID - 1) / 2.0
+    cy = (GRID - 1) / 2.0
+    X = (x - cx)
+    Y = (y - cy)
+    return X, Y
+
+def _design_field(design: str, seed: int, lines: int) -> np.ndarray:
+    """
+    Produce a smooth-ish scalar field over the octant. 'lines' increases band structure.
+    """
+    rng = np.random.RandomState(seed)
+    X, Y = _octant_coords()
+
+    r = np.sqrt(X*X + Y*Y)
+    a = np.arctan2(Y, X + 1e-9)
+
+    # low-frequency “blobs”
+    blobs = np.zeros_like(r, dtype=np.float32)
+    for _ in range(6):
+        cx = rng.uniform(-6, 6)
+        cy = rng.uniform(-6, 6)
+        s  = rng.uniform(6.0, 14.0)
+        blobs += np.exp(-((X-cx)**2 + (Y-cy)**2) / (2*s*s)).astype(np.float32)
+
+    # controllable banding for “unbroken lines”
+    band_amp = (lines / 10.0) * 1.15
+    bands = (
+        0.55*np.sin((r/1.6) + rng.uniform(0, 2*math.pi)) +
+        0.45*np.sin((a*6.0) + rng.uniform(0, 2*math.pi))
+    ).astype(np.float32)
+
+    if design == "rosette_lines":
+        field = 1.15*blobs + band_amp*bands + 0.60*np.cos(a*8.0).astype(np.float32) - 0.10*r.astype(np.float32)
+
+    elif design == "petal_fan":
+        field = 1.10*blobs + 0.85*np.cos(a*10.0).astype(np.float32) - 0.10*r.astype(np.float32) + 0.35*band_amp*bands
+
+    elif design == "rings_spokes":
+        field = 0.95*blobs + 0.95*np.sin(r/1.4).astype(np.float32) + 0.70*np.cos(a*8.0).astype(np.float32) + 0.35*band_amp*bands
+
+    elif design == "labyrinth":
+        # more chunky paths: use abs(sin) “corridors”
+        field = 0.65*blobs + 1.10*np.abs(np.sin(r/1.7)).astype(np.float32) + 0.85*np.abs(np.sin(a*6.0)).astype(np.float32) + 0.25*band_amp*bands
+
+    elif design == "starweave":
+        field = 0.80*blobs + 1.05*np.cos(a*12.0).astype(np.float32) + 0.80*np.sin(r/1.8).astype(np.float32) + 0.35*band_amp*bands
+
+    elif design == "bloomfield":
+        field = 1.60*blobs - 0.12*r.astype(np.float32) + 0.20*band_amp*bands
+
+    else:
+        field = blobs + band_amp*bands
+
+    # tiny noise so quantization isn’t too “stuck”
+    field += (rng.normal(0, 0.03, size=field.shape)).astype(np.float32)
+    return field
+
+def generate_indices(design: str, seed: int, ncolors: int, smooth: int, lines: int) -> np.ndarray:
+    half = GRID // 2 + 1
+    field = _design_field(design, seed, lines)
+    octant = _quantize_field(field, ncolors)
+    if smooth > 0:
+        octant = _majority_smooth(octant, ncolors, iters=smooth)
+
+    if octant.shape != (half, half):
+        octant = octant[:half, :half]
+
+    full = _d8_fold_from_octant(octant)
+    # Optional: one more light smoothing on full grid (keeps symmetry)
+    if smooth >= 4:
+        full = _majority_smooth(full, ncolors, iters=1)
+    return full
+
+# -----------------------------
 # Rendering
-# -------------------------
-def render_chart(grid: np.ndarray, palette: List[str], cell: int = 22, gridline: int = 1) -> Image.Image:
-    h, w = grid.shape
-    img = Image.new("RGB", (w*cell + (w+1)*gridline, h*cell + (h+1)*gridline), (230,230,230))
-    draw = ImageDraw.Draw(img)
+# -----------------------------
+
+def render_png(indices: np.ndarray, palette: List[str], cell: int = 22, gridline: int = 1) -> bytes:
+    h, w = indices.shape
+    img_w = w * cell + (w+1)*gridline
+    img_h = h * cell + (h+1)*gridline
+    im = Image.new("RGB", (img_w, img_h), (0,0,0))
+    draw = ImageDraw.Draw(im)
+
+    # gridline color (slightly light)
+    gl = (40, 46, 56) if gridline > 0 else None
+    if gridline > 0:
+        draw.rectangle([0,0,img_w,img_h], fill=gl)
+
+    def hex_to_rgb(hx: str):
+        hx = hx.lstrip("#")
+        return tuple(int(hx[i:i+2], 16) for i in (0,2,4))
+
+    rgb = [hex_to_rgb(c) for c in palette]
+
     for y in range(h):
         for x in range(w):
-            c = hex_to_rgb(palette[int(grid[y, x])])
-            x0 = x*cell + (x+1)*gridline
-            y0 = y*cell + (y+1)*gridline
-            draw.rectangle([x0, y0, x0+cell-1, y0+cell-1], fill=c)
-    return img
+            idx = int(indices[y, x])
+            color = rgb[idx]
+            x0 = gridline + x*(cell+gridline)
+            y0 = gridline + y*(cell+gridline)
+            draw.rectangle([x0, y0, x0+cell-1, y0+cell-1], fill=color)
 
-def render_preview(grid: np.ndarray, palette: List[str], cell: int = 12) -> Image.Image:
-    h, w = grid.shape
-    img = Image.new("RGB", (w*cell, h*cell), hex_to_rgb(palette[0]))
-    draw = ImageDraw.Draw(img)
-    for y in range(h):
-        for x in range(w):
-            c = hex_to_rgb(palette[int(grid[y, x])])
-            x0, y0 = x*cell, y*cell
-            draw.rectangle([x0, y0, x0+cell-1, y0+cell-1], fill=c)
-    return img
+    bio = io.BytesIO()
+    im.save(bio, format="PNG", optimize=True)
+    return bio.getvalue()
 
-def render_legend(palette: List[str], title: str) -> Image.Image:
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 18)
-        font_small = ImageFont.truetype("DejaVuSans.ttf", 16)
-    except Exception:
-        font = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-    sw, pad = 44, 14
-    rows = len(palette)
-    w = 760
-    h = pad*2 + 40 + rows*(sw+10)
-    img = Image.new("RGB", (w, h), (255,255,255))
-    draw = ImageDraw.Draw(img)
-    draw.text((pad, pad), title, fill=(20,20,20), font=font)
-    y = pad + 40
-    for i, hx in enumerate(palette):
-        draw.rectangle([pad, y, pad+sw, y+sw], fill=hex_to_rgb(hx), outline=(0,0,0))
-        draw.text((pad+sw+14, y+10), f"{i}: {hx}", fill=(20,20,20), font=font_small)
-        y += sw+10
-    return img
+def generate_png_preview(
+    design: str,
+    palette: str,
+    seed: int,
+    ncolors: int = 7,
+    smooth: int = 3,
+    lines: int = 6,
+    cell: int = 22,
+    gridline: int = 1,
+) -> Tuple[bytes, List[str]]:
+    if design not in DESIGN_LABELS:
+        design = "rosette_lines"
+    if palette not in PALETTES:
+        palette = "jewel_bazaar"
 
-def grid_to_csv_bytes(grid: np.ndarray) -> bytes:
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["y\\x"] + list(range(grid.shape[1])))
-    for y in range(grid.shape[0]):
-        w.writerow([y] + list(map(int, grid[y])))
-    return buf.getvalue().encode("utf-8")
+    pal = PALETTES[palette][:ncolors]
+    indices = generate_indices(design=design, seed=seed, ncolors=ncolors, smooth=smooth, lines=lines)
+    png = render_png(indices, pal, cell=cell, gridline=gridline)
 
-def palette_to_csv_bytes(palette: List[str]) -> bytes:
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["index", "hex"])
-    for i, hx in enumerate(palette):
-        w.writerow([i, hx])
-    return buf.getvalue().encode("utf-8")
-
-def build_pdf_bytes(title: str, chart_img: Image.Image, legend_img: Image.Image) -> bytes:
-    pdf_buf = io.BytesIO()
-    c = canvas.Canvas(pdf_buf, pagesize=landscape(letter))
-    pw, ph = landscape(letter)
-    m = 36
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(m, ph - m, title)
-    top_y = ph - m - 24
-    left_w = pw * 0.62
-    right_w = pw - left_w - 2*m
-
-    # Chart
-    chart_reader = ImageReader(chart_img)
-    cw, ch = chart_img.size
-    chart_max_w = left_w - m
-    chart_max_h = top_y - m
-    scale = min(chart_max_w / cw, chart_max_h / ch)
-    c.drawImage(chart_reader, m, m, width=cw*scale, height=ch*scale, preserveAspectRatio=True, mask='auto')
-
-    # Legend
-    legend_reader = ImageReader(legend_img)
-    lw, lh = legend_img.size
-    leg_max_w = right_w
-    leg_max_h = top_y - m
-    lscale = min(leg_max_w / lw, leg_max_h / lh)
-    lx = left_w
-    c.drawImage(legend_reader, lx, top_y - lh*lscale, width=lw*lscale, height=lh*lscale, preserveAspectRatio=True, mask='auto')
-
-    c.setFont("Helvetica", 10)
-    c.drawString(m, 14, "35×35 stitches • perfect 8-way symmetry (D8) • 7 colors incl. background (index 0)")
-    c.showPage()
-    c.save()
-    return pdf_buf.getvalue()
-
-def generate_bundle(design_key: str, palette_key: str, seed: int = 0, cell: int = 22, gridline: int = 1) -> bytes:
-    if design_key not in DESIGNS:
-        raise KeyError(f"Unknown design_key: {design_key}. Options: {sorted(DESIGNS)}")
-    if palette_key not in PALETTES:
-        raise KeyError(f"Unknown palette_key: {palette_key}. Options: {sorted(PALETTES)}")
-
-    grid = DESIGNS[design_key](seed)
-    palette = PALETTES[palette_key]
-
-    chart = render_chart(grid, palette, cell=cell, gridline=gridline)
-    preview = render_preview(grid, palette, cell=max(6, cell//2))
-    legend = render_legend(palette, f"{design_key} — {palette_key} (35×35, 7 colors incl. background)")
-    pdf = build_pdf_bytes(f"{design_key} — {palette_key} — seed {seed}", chart, legend)
-
-    # Pack ZIP
-    zbuf = io.BytesIO()
-    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        # images
-        for name, img in [("chart.png", chart), ("preview.png", preview), ("legend.png", legend)]:
-            b = io.BytesIO()
-            img.save(b, format="PNG")
-            z.writestr(name, b.getvalue())
-        z.writestr("pattern_indices.csv", grid_to_csv_bytes(grid))
-        z.writestr("palette.csv", palette_to_csv_bytes(palette))
-        z.writestr("chart.pdf", pdf)
-        z.writestr("README.txt", (
-            "Kaleido Stitch bundle\\n\\n"
-            "- chart.png: grid + colored blocks\\n"
-            "- preview.png: colored blocks, no grid\\n"
-            "- legend.png: index->hex list\\n"
-            "- pattern_indices.csv: 35×35 indices (0..6)\\n"
-            "- palette.csv: index->hex\\n"
-            "- chart.pdf: printable chart + legend\\n\\n"
-            "Notes:\\n"
-            "- index 0 is background\\n"
-            "- design is guaranteed D8 (8-way) symmetric\\n"
-        ))
-    return zbuf.getvalue()
+    used = []
+    # return the actual palette entries (index order) for UI chips
+    for c in pal:
+        used.append(c)
+    return png, used
