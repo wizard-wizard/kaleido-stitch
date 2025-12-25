@@ -65,6 +65,68 @@ def hex_to_rgb(h: str) -> Tuple[int, int, int]:
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
+def _mode_filter(idx: np.ndarray, radius: int = 1, passes: int = 1) -> np.ndarray:
+    """Replace each cell with the most common value in its neighborhood."""
+    out = idx.copy()
+    h, w = out.shape
+    for _ in range(max(0, passes)):
+        nxt = out.copy()
+        for y in range(h):
+            y0 = max(0, y - radius)
+            y1 = min(h, y + radius + 1)
+            for x in range(w):
+                x0 = max(0, x - radius)
+                x1 = min(w, x + radius + 1)
+                window = out[y0:y1, x0:x1].ravel()
+                vals, counts = np.unique(window, return_counts=True)
+                nxt[y, x] = vals[np.argmax(counts)]
+        out = nxt
+    return out
+
+def _outline_edges(idx: np.ndarray, ink_idx: int = 1, thickness: int = 1) -> np.ndarray:
+    """Draw an outline where neighboring cells differ (8-neighborhood)."""
+    h, w = idx.shape
+    edge = np.zeros((h, w), dtype=bool)
+
+    # Compare against shifted versions (8 directions)
+    shifts = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+    for dy, dx in shifts:
+        y0 = max(0, dy); y1 = h + min(0, dy)
+        x0 = max(0, dx); x1 = w + min(0, dx)
+        a = idx[y0:y1, x0:x1]
+        b = idx[y0-dy:y1-dy, x0-dx:x1-dx]
+        edge[y0:y1, x0:x1] |= (a != b)
+
+    out = idx.copy()
+    out[edge] = ink_idx
+
+    # Thicken by simple dilation
+    for _ in range(max(0, thickness - 1)):
+        e2 = edge.copy()
+        for dy, dx in shifts:
+            y0 = max(0, dy); y1 = h + min(0, dy)
+            x0 = max(0, dx); x1 = w + min(0, dx)
+            e2[y0:y1, x0:x1] |= edge[y0-dy:y1-dy, x0-dx:x1-dx]
+        edge = e2
+        out[edge] = ink_idx
+
+    return out
+
+def postprocess_indices(
+    idx: np.ndarray,
+    coherence: int = 0,
+    radius: int = 1,
+    ink: bool = False,
+    ink_idx: int = 1,
+    ink_thickness: int = 1,
+) -> np.ndarray:
+    out = idx
+    if coherence and coherence > 0:
+        out = _mode_filter(out, radius=radius, passes=coherence)
+    if ink:
+        out = _outline_edges(out, ink_idx=ink_idx, thickness=ink_thickness)
+    return out
+
 # -------------------------
 # Palettes (7 colors each)
 # index 0 = background
