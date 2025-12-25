@@ -1,175 +1,305 @@
 
-from __future__ import annotations
-
-import io, os, uuid, zipfile
+import base64
+import io
 from datetime import datetime
-from flask import Flask, request, send_file, render_template_string
 
+from flask import Flask, jsonify, request, render_template_string
 import kaleido
 
 app = Flask(__name__)
 
-GENERATED_DIR = os.path.join(app.root_path, "static", "generated")
-os.makedirs(GENERATED_DIR, exist_ok=True)
-
-TEMPLATE = """
+PAGE = """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Kaleido Stitch</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 28px; max-width: 920px; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; }
-    label { display:block; font-weight: 600; margin-top: 10px; }
-    select, input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
-    button { margin-top: 14px; padding: 12px 14px; border-radius: 10px; border: 0; background: #222; color: #fff; font-weight: 700; cursor: pointer; }
-    button:hover { opacity: 0.92; }
-    .small { color:#444; font-size: 0.95rem; line-height: 1.35; }
-    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    :root{
+      --bg: #0b0f14;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.10);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.70);
+      --stroke: rgba(255,255,255,0.14);
+      --accent: #7dd3fc;
+      --accent2: #a78bfa;
+    }
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      background: radial-gradient(1200px 800px at 20% 0%, rgba(167,139,250,0.18), transparent 55%),
+                  radial-gradient(900px 700px at 90% 10%, rgba(125,211,252,0.16), transparent 55%),
+                  var(--bg);
+      color: var(--text);
+    }
+    .wrap{ max-width: 980px; margin: 0 auto; padding: 18px 16px 40px; }
+    h1{ margin: 10px 0 6px; font-size: 22px; letter-spacing: 0.2px; }
+    p{ margin: 0 0 14px; color: var(--muted); line-height: 1.35; }
+
+    .grid{
+      display:grid;
+      grid-template-columns: 360px 1fr;
+      gap: 14px;
+    }
+    @media (max-width: 860px){
+      .grid{ grid-template-columns: 1fr; }
+    }
+
+    .card{
+      background: var(--panel);
+      border: 1px solid var(--stroke);
+      border-radius: 14px;
+      padding: 14px;
+      backdrop-filter: blur(6px);
+    }
+
+    label{ display:block; font-size: 12px; color: var(--muted); margin: 10px 0 6px; }
+    select, input[type="number"], input[type="range"]{
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--stroke);
+      border-radius: 10px;
+      padding: 10px 10px;
+      font-size: 14px;
+      outline: none;
+    }
+    input[type="range"]{ padding: 10px 0; }
+    .row{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    @media (max-width: 420px){
+      .row{ grid-template-columns: 1fr; }
+    }
+
+    button{
+      margin-top: 12px;
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 12px;
+      font-size: 15px;
+      font-weight: 650;
+      color: #061019;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      cursor: pointer;
+    }
+    button:active{ transform: translateY(1px); }
+
+    .meta{ margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .chips{ display:flex; flex-wrap:wrap; gap: 8px; margin-top: 10px; }
+    .chip{
+      border: 1px solid var(--stroke);
+      border-radius: 999px;
+      padding: 6px 10px;
+      background: rgba(0,0,0,0.16);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .preview{
+      display:flex;
+      flex-direction: column;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+      min-height: 420px;
+    }
+    .imgbox{
+      width: 100%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      background: rgba(0,0,0,0.20);
+      border: 1px dashed var(--stroke);
+      border-radius: 14px;
+      padding: 12px;
+      overflow:hidden;
+    }
+    img{ max-width: 100%; height:auto; border-radius: 10px; image-rendering: pixelated; }
+    .actions{ display:flex; gap: 10px; width:100%; justify-content:center; flex-wrap:wrap; }
+    .linkbtn{
+      display:inline-block;
+      text-decoration:none;
+      border: 1px solid var(--stroke);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .hint{ font-size: 12px; color: var(--muted); text-align:center; }
   </style>
 </head>
+
 <body>
-  <h1>Kaleido Stitch</h1>
-  <p class="small">Generate a 35×35 cross-stitch chart with perfect 8-way kaleidoscopic symmetry (D8). Output is a ZIP with PNGs + CSV + printable PDF.</p>
+  <div class="wrap">
+    <h1>Kaleido Stitch</h1>
+    <p>35×35, perfect 8-way symmetry, up to 7 colors. Generate an image you can long-press on your phone to save.</p>
 
-  <div class="row">
-    <div class="card">
-      <form action="/generate" method="post">
-        <label>Design</label>
-        <select name="design">
-          {% for k in designs %}
-            <option value="{{k}}">{{k}}</option>
-          {% endfor %}
-        </select>
+    <div class="grid">
+      <div class="card">
+        <form id="form">
+          <label>Design</label>
+          <select name="design">
+            {% for k, v in designs.items() %}
+              <option value="{{k}}">{{v}}</option>
+            {% endfor %}
+          </select>
 
-        <label>Palette</label>
-        <select name="palette">
-          {% for k in palettes %}
-            <option value="{{k}}">{{k}}</option>
-          {% endfor %}
-        </select>
+          <label>Palette</label>
+          <select name="palette">
+            {% for k, v in palettes.items() %}
+              <option value="{{k}}">{{v}}</option>
+            {% endfor %}
+          </select>
 
-        <label>Seed (changes the variation)</label>
-        <input name="seed" type="number" value="0" min="0" max="999999" />
+          <div class="row">
+            <div>
+              <label>Seed (0 = random)</label>
+              <input type="number" name="seed" value="0" min="0" step="1">
+            </div>
+            <div>
+              <label># Colors (3–7)</label>
+              <input type="number" name="ncolors" value="7" min="3" max="7" step="1">
+            </div>
+          </div>
 
-        <label>Chart cell size (pixels)</label>
-        <input name="cell" type="number" value="22" min="10" max="60" />
+          <label>Contiguity (smoother blocks)</label>
+          <input type="range" name="smooth" min="0" max="6" value="3">
 
-        <label>Gridline thickness</label>
-        <input name="gridline" type="number" value="1" min="0" max="4" />
+          <label>Line bias (more unbroken lines)</label>
+          <input type="range" name="lines" min="0" max="10" value="6">
 
-        <button type="submit">Generate ZIP</button>
-      </form>
-    </div>
+          <div class="row">
+            <div>
+              <label>Cell size (px)</label>
+              <input type="number" name="cell" value="22" min="10" max="64" step="1">
+            </div>
+            <div>
+              <label>Gridline (px)</label>
+              <input type="number" name="gridline" value="1" min="0" max="4" step="1">
+            </div>
+          </div>
 
-    <div class="card">
-      <h3>Tips</h3>
-      <ul class="small">
-        <li>If you like a pattern, keep its <code>seed</code> so you can regenerate it later.</li>
-        <li>Set gridline to <code>0</code> if you want a clean chart image without the gray grid border.</li>
-        <li>Want more palettes/designs? Add them in <code>kaleido.py</code> — it’s intentionally hackable.</li>
-      </ul>
-      <h3>CLI</h3>
-      <p class="small">You can also generate from the command line:</p>
-      <pre class="small"><code>python generate.py --design rings_spokes --palette jewel_bazaar --seed 123 --out out</code></pre>
+          <button type="submit">Generate image</button>
+          <div class="meta" id="status">Ready.</div>
+          <div class="chips" id="chips"></div>
+        </form>
+      </div>
+
+      <div class="card preview">
+        <div class="imgbox">
+          <img id="out" alt="Generated cross stitch chart preview" />
+        </div>
+        <div class="actions">
+          <a class="linkbtn" id="download" href="#" download="kaleido.png" style="display:none">Download PNG</a>
+        </div>
+        <div class="hint">Tip: on iPhone you can also long-press the image → “Save to Photos”.</div>
+      </div>
     </div>
   </div>
+
+<script>
+  const form = document.getElementById('form');
+  const out = document.getElementById('out');
+  const statusEl = document.getElementById('status');
+  const chips = document.getElementById('chips');
+  const download = document.getElementById('download');
+
+  function setStatus(t){ statusEl.textContent = t; }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    chips.innerHTML = "";
+    download.style.display = "none";
+    setStatus("Generating…");
+
+    const fd = new FormData(form);
+    const resp = await fetch("/api/generate", { method: "POST", body: fd });
+    if (!resp.ok){
+      setStatus("Oops — generation failed.");
+      return;
+    }
+    const data = await resp.json();
+
+    out.src = data.png_data_url;
+    download.href = data.png_data_url;
+    download.download = data.filename || "kaleido.png";
+    download.style.display = "inline-block";
+
+    setStatus(data.caption || "Done.");
+
+    (data.used_colors || []).forEach((hex, i) => {
+      const c = document.createElement("div");
+      c.className = "chip";
+      c.textContent = `#${i}: ${hex}`;
+      c.style.borderColor = hex;
+      chips.appendChild(c);
+    });
+  });
+</script>
 </body>
 </html>
 """
 
 @app.get("/")
-def index():
+def home():
     return render_template_string(
-        TEMPLATE,
-        designs=sorted(kaleido.DESIGNS.keys()),
-        palettes=sorted(kaleido.PALETTES.keys()),
+        PAGE,
+        designs=kaleido.DESIGN_LABELS,
+        palettes=kaleido.PALETTE_LABELS,
     )
 
-@app.post("/generate")
-def generate():
-    design = request.form.get("design", "rings_spokes")
+@app.post("/api/generate")
+def api_generate():
+    design = request.form.get("design", "rosette_lines")
     palette = request.form.get("palette", "jewel_bazaar")
     seed = int(request.form.get("seed", "0") or "0")
+    ncolors = int(request.form.get("ncolors", "7") or "7")
+    smooth = int(request.form.get("smooth", "3") or "3")
+    lines = int(request.form.get("lines", "6") or "6")
     cell = int(request.form.get("cell", "22") or "22")
     gridline = int(request.form.get("gridline", "1") or "1")
 
-    zbytes = kaleido.generate_bundle(design, palette, seed=seed, cell=cell, gridline=gridline)
+    if ncolors < 3: ncolors = 3
+    if ncolors > 7: ncolors = 7
+    if smooth < 0: smooth = 0
+    if smooth > 6: smooth = 6
+    if lines < 0: lines = 0
+    if lines > 10: lines = 10
 
-    # Extract PNGs from the in-memory ZIP and save them so the browser can display them
-    token = uuid.uuid4().hex
-    preview_name = f"{token}_preview.png"
-    chart_name = f"{token}_chart.png"
-    preview_path = os.path.join(GENERATED_DIR, preview_name)
-    chart_path = os.path.join(GENERATED_DIR, chart_name)
+    if seed == 0:
+      # deterministic-enough per request, but still “random” for users
+      seed = int(datetime.now().strftime("%H%M%S%f")) % 2_000_000_000
 
-    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as z:
-        # Find likely image files in the bundle
-        names = z.namelist()
-        preview_candidates = [n for n in names if n.lower().endswith(".png") and "preview" in n.lower()]
-        chart_candidates = [n for n in names if n.lower().endswith(".png") and ("chart" in n.lower() or "grid" in n.lower())]
+    png_bytes, used_colors = kaleido.generate_png_preview(
+        design=design,
+        palette=palette,
+        seed=seed,
+        ncolors=ncolors,
+        smooth=smooth,
+        lines=lines,
+        cell=cell,
+        gridline=gridline,
+    )
 
-        if not preview_candidates:
-            # fallback: any png
-            preview_candidates = [n for n in names if n.lower().endswith(".png")]
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"kaleido_{design}_{palette}_seed{seed}_{stamp}.png"
 
-        if not preview_candidates:
-            return "No PNGs found in bundle ZIP.", 500
+    return jsonify({
+        "png_data_url": "data:image/png;base64," + b64,
+        "used_colors": used_colors,
+        "filename": fname,
+        "caption": f"{design} • {palette} • seed {seed} • {ncolors} colors",
+    })
 
-        preview_src = preview_candidates[0]
-        chart_src = chart_candidates[0] if chart_candidates else preview_src
-
-        with z.open(preview_src) as f:
-            with open(preview_path, "wb") as out:
-                out.write(f.read())
-
-        with z.open(chart_src) as f:
-            with open(chart_path, "wb") as out:
-                out.write(f.read())
-
-    preview_url = f"/static/generated/{preview_name}"
-    chart_url = f"/static/generated/{chart_name}"
-
-    return render_template_string("""
-    <!doctype html>
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Kaleido Stitch — Result</title>
-        <style>
-          body { font-family: system-ui, sans-serif; padding: 16px; }
-          img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 12px; }
-          .hint { color: #555; margin: 6px 0 14px; }
-          a.button {
-            display: inline-block; padding: 10px 14px; border: 1px solid #333;
-            border-radius: 10px; text-decoration: none; color: #111; margin-right: 10px;
-          }
-          .block { margin-bottom: 22px; }
-        </style>
-      </head>
-      <body>
-        <h2>Your design</h2>
-        <div class="hint">iPhone tip: press and hold the image → “Save to Photos”.</div>
-
-        <div class="block">
-          <h3>Preview (easy to save)</h3>
-          <img src="{{ preview_url }}?v={{ token }}" alt="Preview">
-          <p><a class="button" href="{{ preview_url }}" target="_blank">Open preview</a></p>
-        </div>
-
-        <div class="block">
-          <h3>Chart (with grid)</h3>
-          <img src="{{ chart_url }}?v={{ token }}" alt="Chart">
-          <p><a class="button" href="{{ chart_url }}" target="_blank">Open chart</a></p>
-        </div>
-
-        <p><a class="button" href="/">Make another</a></p>
-      </body>
-    </html>
-    """, preview_url=preview_url, chart_url=chart_url, token=token)
 if __name__ == "__main__":
-    # default: http://127.0.0.1:5000
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
