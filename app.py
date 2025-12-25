@@ -1,13 +1,16 @@
 
 from __future__ import annotations
 
-import io, os
+import io, os, uuid, zipfile
 from datetime import datetime
 from flask import Flask, request, send_file, render_template_string
 
 import kaleido
 
 app = Flask(__name__)
+
+GENERATED_DIR = os.path.join(app.root_path, "static", "generated")
+os.makedirs(GENERATED_DIR, exist_ok=True)
 
 TEMPLATE = """
 <!doctype html>
@@ -95,15 +98,77 @@ def generate():
 
     zbytes = kaleido.generate_bundle(design, palette, seed=seed, cell=cell, gridline=gridline)
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"kaleido_{design}_{palette}_seed{seed}_{stamp}.zip"
-    return send_file(
-        io.BytesIO(zbytes),
-        mimetype="application/zip",
-        as_attachment=True,
-        download_name=fname,
-    )
+    # Extract PNGs from the in-memory ZIP and save them so the browser can display them
+    token = uuid.uuid4().hex
+    preview_name = f"{token}_preview.png"
+    chart_name = f"{token}_chart.png"
+    preview_path = os.path.join(GENERATED_DIR, preview_name)
+    chart_path = os.path.join(GENERATED_DIR, chart_name)
 
+    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as z:
+        # Find likely image files in the bundle
+        names = z.namelist()
+        preview_candidates = [n for n in names if n.lower().endswith(".png") and "preview" in n.lower()]
+        chart_candidates = [n for n in names if n.lower().endswith(".png") and ("chart" in n.lower() or "grid" in n.lower())]
+
+        if not preview_candidates:
+            # fallback: any png
+            preview_candidates = [n for n in names if n.lower().endswith(".png")]
+
+        if not preview_candidates:
+            return "No PNGs found in bundle ZIP.", 500
+
+        preview_src = preview_candidates[0]
+        chart_src = chart_candidates[0] if chart_candidates else preview_src
+
+        with z.open(preview_src) as f:
+            with open(preview_path, "wb") as out:
+                out.write(f.read())
+
+        with z.open(chart_src) as f:
+            with open(chart_path, "wb") as out:
+                out.write(f.read())
+
+    preview_url = f"/static/generated/{preview_name}"
+    chart_url = f"/static/generated/{chart_name}"
+
+    return render_template_string("""
+    <!doctype html>
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Kaleido Stitch — Result</title>
+        <style>
+          body { font-family: system-ui, sans-serif; padding: 16px; }
+          img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 12px; }
+          .hint { color: #555; margin: 6px 0 14px; }
+          a.button {
+            display: inline-block; padding: 10px 14px; border: 1px solid #333;
+            border-radius: 10px; text-decoration: none; color: #111; margin-right: 10px;
+          }
+          .block { margin-bottom: 22px; }
+        </style>
+      </head>
+      <body>
+        <h2>Your design</h2>
+        <div class="hint">iPhone tip: press and hold the image → “Save to Photos”.</div>
+
+        <div class="block">
+          <h3>Preview (easy to save)</h3>
+          <img src="{{ preview_url }}?v={{ token }}" alt="Preview">
+          <p><a class="button" href="{{ preview_url }}" target="_blank">Open preview</a></p>
+        </div>
+
+        <div class="block">
+          <h3>Chart (with grid)</h3>
+          <img src="{{ chart_url }}?v={{ token }}" alt="Chart">
+          <p><a class="button" href="{{ chart_url }}" target="_blank">Open chart</a></p>
+        </div>
+
+        <p><a class="button" href="/">Make another</a></p>
+      </body>
+    </html>
+    """, preview_url=preview_url, chart_url=chart_url, token=token)
 if __name__ == "__main__":
     # default: http://127.0.0.1:5000
     port = int(os.environ.get("PORT", "5000"))
